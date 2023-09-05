@@ -35,6 +35,8 @@ BEGIN
             ELSIF v_data_type IN ('VARCHAR2', 'CHAR') THEN
                 -- Generate random string data
                 v_sql := 'INSERT INTO ' || p_table_name || '(' || v_column_name || ') VALUES (''' || DBMS_RANDOM.STRING('A', 10) || ''')';
+            ELSIF v_data_type IN ('DATE', 'TIMESTAMP(6)', 'TIMESTAMP(6) WITH TIME ZONE') THEN
+                v_sql := 'INSERT INTO ' || p_table_name || '(' || v_column_name || ') VALUES ( systimestamp )'; 
             ELSE
                 -- Handle other data types as needed
                 DBMS_OUTPUT.PUT_LINE('Table contains datatypes not supported...');
@@ -42,7 +44,7 @@ BEGIN
             END IF;
             
             -- Execute the generated SQL
-            -- DBMS_OUTPUT.PUT_LINE(v_sql);
+            DBMS_OUTPUT.PUT_LINE(v_sql);
             EXECUTE IMMEDIATE v_sql;
         END LOOP;
     END LOOP;
