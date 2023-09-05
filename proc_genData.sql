@@ -37,7 +37,7 @@ BEGIN
                 v_sql := 'INSERT INTO ' || p_table_name || '(' || v_column_name || ') VALUES (''' || DBMS_RANDOM.STRING('A', 10) || ''')';
             ELSE
                 -- Handle other data types as needed
-                -- Future work
+                DBMS_OUTPUT.PUT_LINE('Table contains datatypes not supported...');
                 NULL;
             END IF;
             
