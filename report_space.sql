@@ -8,278 +8,745 @@ GRANT SELECT ON dba_tab_partitions TO public;
 
 */
 
-CREATE OR REPLACE PROCEDURE report_table_size (
-    p_owner       IN VARCHAR2 DEFAULT NULL,
-    p_table_name  IN VARCHAR2,
-    p_live_count  IN BOOLEAN  DEFAULT FALSE  -- TRUE for exact count, FALSE for stats-based
-) AS
-    v_owner       VARCHAR2(128);
-    v_row_count   NUMBER := NULL;
-    v_count_sql   VARCHAR2(1000);
-BEGIN
-    v_owner := NVL(UPPER(p_owner), SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'));
+/*
 
-    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
-    DBMS_OUTPUT.PUT_LINE('Table Size Report');
-    DBMS_OUTPUT.PUT_LINE('Schema : ' || v_owner);
-    DBMS_OUTPUT.PUT_LINE('Table  : ' || UPPER(p_table_name));
-    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
+Packaged version
 
-    --------------------------------------------------------------------
-    -- 1. Retrieve Row Count (from dictionary or live count)
-    --------------------------------------------------------------------
-    IF p_live_count THEN
-        v_count_sql := 'SELECT COUNT(*) FROM ' || v_owner || '.' || UPPER(p_table_name);
-        EXECUTE IMMEDIATE v_count_sql INTO v_row_count;
-    ELSE
-        SELECT num_rows
-          INTO v_row_count
-          FROM dba_tables
-         WHERE owner = v_owner
-           AND table_name = UPPER(p_table_name);
-    END IF;
+Package spec
 
-    --------------------------------------------------------------------
-    -- 2. Display Table Size Summary
-    --------------------------------------------------------------------
-    FOR rec IN (
-        SELECT
-            segment_name AS table_name,
-            ROUND(SUM(bytes)/1024/1024, 2) AS size_mb,
-            ROUND(SUM(bytes)/1024/1024/1024, 2) AS size_gb,
-            ROUND(SUM(bytes)/1024/1024/1024/1024, 4) AS size_tb
-        FROM
-            dba_segments
-        WHERE
-            owner = v_owner
-            AND segment_name = UPPER(p_table_name)
-        GROUP BY
-            segment_name
-    ) LOOP
-        DBMS_OUTPUT.PUT_LINE('Row count     : ' || TO_CHAR(v_row_count, '999,999,999,999'));
-        DBMS_OUTPUT.PUT_LINE('Table size (MB): ' || TO_CHAR(rec.size_mb, '999,999,999.00'));
-        DBMS_OUTPUT.PUT_LINE('Table size (GB): ' || TO_CHAR(rec.size_gb, '999,999,999.00'));
-        DBMS_OUTPUT.PUT_LINE('Table size (TB): ' || TO_CHAR(rec.size_tb, '999,999,999.0000'));
-    END LOOP;
+*/
+CREATE OR REPLACE PACKAGE space_report_pkg AS
+    PROCEDURE report_schema_space;
 
-    --------------------------------------------------------------------
-    -- 3. Partition Breakdown (if any)
-    --------------------------------------------------------------------
-    DBMS_OUTPUT.PUT_LINE('');
-    DBMS_OUTPUT.PUT_LINE('Partition Breakdown (if any)');
-    DBMS_OUTPUT.PUT_LINE(
-        RPAD('PARTITION_NAME', 30) ||
-        LPAD('SIZE_MB', 15) ||
-        LPAD('SIZE_GB', 15) ||
-        LPAD('SIZE_TB', 15) ||
-        LPAD('ROWS', 15)
+    PROCEDURE report_table_size (
+        p_table_name IN VARCHAR2,
+        p_live_count IN BOOLEAN DEFAULT FALSE
     );
-    DBMS_OUTPUT.PUT_LINE(RPAD('-', 90, '-'));
 
-    FOR part_rec IN (
-        SELECT
-            s.partition_name,
-            ROUND(SUM(s.bytes)/1024/1024, 2) AS size_mb,
-            ROUND(SUM(s.bytes)/1024/1024/1024, 2) AS size_gb,
-            ROUND(SUM(s.bytes)/1024/1024/1024/1024, 4) AS size_tb,
-            NVL(p.num_rows, 0) AS num_rows
-        FROM
-            dba_segments s
-            LEFT JOIN dba_tab_partitions p
-              ON p.table_owner = s.owner
-             AND p.table_name = s.segment_name
-             AND p.partition_name = s.partition_name
-        WHERE
-            s.owner = v_owner
-            AND s.segment_name = UPPER(p_table_name)
-            AND s.partition_name IS NOT NULL
-        GROUP BY
-            s.partition_name, p.num_rows
-        ORDER BY
-            size_mb DESC
-    ) LOOP
-        DBMS_OUTPUT.PUT_LINE(
-            RPAD(part_rec.partition_name, 30) ||
-            LPAD(TO_CHAR(part_rec.size_mb, '999,999,999.00'), 15) ||
-            LPAD(TO_CHAR(part_rec.size_gb, '999,999,999.00'), 15) ||
-            LPAD(TO_CHAR(part_rec.size_tb, '999,999,999.0000'), 15) ||
-            LPAD(TO_CHAR(part_rec.num_rows, '999,999,999,999'), 15)
-        );
-    END LOOP;
+    PROCEDURE report_table_storage_map (
+        p_table_name IN VARCHAR2
+    );
 
-    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
+    PROCEDURE report_table_datafiles (
+        p_table_name IN VARCHAR2
+    );
 
-EXCEPTION
-    WHEN NO_DATA_FOUND THEN
-        DBMS_OUTPUT.PUT_LINE('No table found for ' || v_owner || '.' || p_table_name);
-    WHEN OTHERS THEN
-        DBMS_OUTPUT.PUT_LINE('Error: ' || SQLERRM);
-END;
+    PROCEDURE report_json_collections (
+        p_collection_name IN VARCHAR2 DEFAULT NULL,
+        p_live_count      IN BOOLEAN  DEFAULT FALSE
+    );
+END space_report_pkg;
 /
 
+/*
 
+Package body 
 
-CREATE OR REPLACE PROCEDURE report_space (
-    p_schema_name IN VARCHAR2 DEFAULT NULL
-) AS
-BEGIN
-    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
-    DBMS_OUTPUT.PUT_LINE('Space Usage Report for Schema: ' ||
-                         SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'));
-    DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
-    DBMS_OUTPUT.PUT_LINE('');
+*/
+CREATE OR REPLACE PACKAGE BODY space_report_pkg AS
 
-    FOR rec IN (
-        SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AS schema_name,
-               ROUND(SUM(bytes) / 1024 / 1024, 2) AS used_mb,
-               ROUND(SUM(bytes) / 1024 / 1024 / 1024, 2) AS used_gb
-          FROM user_segments
-         GROUP BY SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
-    ) LOOP
-        DBMS_OUTPUT.PUT_LINE('TOTAL USAGE');
-        DBMS_OUTPUT.PUT_LINE('  SCHEMA : ' || rec.schema_name);
-        DBMS_OUTPUT.PUT_LINE('  USED_MB: ' || TO_CHAR(rec.used_mb, '999,999,999.00'));
-        DBMS_OUTPUT.PUT_LINE('  USED_GB: ' || TO_CHAR(rec.used_gb, '999,999,999.00'));
-        DBMS_OUTPUT.PUT_LINE('');
-    END LOOP;
-
-    DBMS_OUTPUT.PUT_LINE('DETAILED PARTITION USAGE:');
-    DBMS_OUTPUT.PUT_LINE(
-        RPAD('OBJECT_NAME', 32) ||
-        RPAD('PARTITION_NAME', 32) ||
-        RPAD('TABLESPACE_NAME', 22) ||
-        LPAD('USED_MB', 14) ||
-        LPAD('USED_GB', 14) ||
-        LPAD('ROW_COUNT', 14)
-    );
-    DBMS_OUTPUT.PUT_LINE(RPAD('-', 128, '-'));
-
-    FOR rec IN (
-        SELECT s.segment_name AS object_name,
-               s.partition_name,
-               s.tablespace_name,
-               ROUND(SUM(s.bytes) / 1024 / 1024, 2) AS used_mb,
-               ROUND(SUM(s.bytes) / 1024 / 1024 / 1024, 2) AS used_gb,
-               NVL(tp.num_rows, 0) AS row_count
-          FROM user_segments s
-               LEFT JOIN user_tab_partitions tp
-                 ON tp.table_name = s.segment_name
-                AND tp.partition_name = s.partition_name
-         WHERE s.partition_name IS NOT NULL
-         GROUP BY s.segment_name,
-                  s.partition_name,
-                  s.tablespace_name,
-                  tp.num_rows
-         ORDER BY SUM(s.bytes) DESC
-    ) LOOP
-        DBMS_OUTPUT.PUT_LINE(
-            RPAD(NVL(rec.object_name, ' '), 32) ||
-            RPAD(NVL(rec.partition_name, ' '), 32) ||
-            RPAD(NVL(rec.tablespace_name, ' '), 22) ||
-            LPAD(TO_CHAR(rec.used_mb, '999,999,990.00'), 14) ||
-            LPAD(TO_CHAR(rec.used_gb, '999,999,990.00'), 14) ||
-            LPAD(TO_CHAR(rec.row_count, '999,999,999'), 14)
-        );
-    END LOOP;
-
-    DBMS_OUTPUT.PUT_LINE('');
-    DBMS_OUTPUT.PUT_LINE('NON-PARTITIONED OBJECT USAGE');
-    DBMS_OUTPUT.PUT_LINE(
-        RPAD('OBJECT_NAME', 32) ||
-        RPAD('SEGMENT_TYPE', 28) ||
-        RPAD('TABLESPACE_NAME', 22) ||
-        LPAD('USED_MB', 14) ||
-        LPAD('USED_GB', 14) ||
-        LPAD('ROW_COUNT', 14)
-    );
-    DBMS_OUTPUT.PUT_LINE(RPAD('-', 128, '-'));
-
-    FOR rec IN (
-        SELECT s.segment_name AS object_name,
-               s.segment_type,
-               s.tablespace_name,
-               ROUND(SUM(s.bytes) / 1024 / 1024, 2) AS used_mb,
-               ROUND(SUM(s.bytes) / 1024 / 1024 / 1024, 2) AS used_gb,
-               NVL(t.num_rows, 0) AS row_count
-          FROM user_segments s
-               LEFT JOIN user_tables t
-                 ON t.table_name = s.segment_name
-         WHERE s.partition_name IS NULL
-         GROUP BY s.segment_name,
-                  s.segment_type,
-                  s.tablespace_name,
-                  t.num_rows
-         ORDER BY SUM(s.bytes) DESC
-    ) LOOP
-        DBMS_OUTPUT.PUT_LINE(
-            RPAD(NVL(rec.object_name, ' '), 32) ||
-            RPAD(NVL(rec.segment_type, ' '), 28) ||
-            RPAD(NVL(rec.tablespace_name, ' '), 22) ||
-            LPAD(TO_CHAR(rec.used_mb, '999,999,990.00'), 14) ||
-            LPAD(TO_CHAR(rec.used_gb, '999,999,990.00'), 14) ||
-            LPAD(TO_CHAR(rec.row_count, '999,999,999'), 14)
-        );
-    END LOOP;
-
-    DECLARE
-        v_colname  VARCHAR2(128);
-        v_sql      VARCHAR2(4000);
-        c          SYS_REFCURSOR;
-        r_collection_name  VARCHAR2(128);
-        r_storage_model    VARCHAR2(32);
-        r_used_mb          NUMBER;
-        r_row_count        NUMBER;
+    ------------------------------------------------------------------
+    -- Helpers
+    ------------------------------------------------------------------
+    PROCEDURE put_line(p_text IN VARCHAR2 DEFAULT NULL) IS
     BEGIN
-        DBMS_OUTPUT.PUT_LINE('');
-        DBMS_OUTPUT.PUT_LINE('JSON COLLECTION TABLES');
-        DBMS_OUTPUT.PUT_LINE(
-            RPAD('COLLECTION_NAME', 32) ||
-            RPAD('STORAGE_MODEL', 16) ||
+        DBMS_OUTPUT.PUT_LINE(p_text);
+    END put_line;
+
+    PROCEDURE put_rule(p_len IN PLS_INTEGER DEFAULT 60) IS
+    BEGIN
+        DBMS_OUTPUT.PUT_LINE(RPAD('-', p_len, '-'));
+    END put_rule;
+
+    FUNCTION fmt_num(p_value IN NUMBER, p_model IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN TO_CHAR(NVL(p_value, 0), p_model);
+    END fmt_num;
+
+    FUNCTION table_exists(p_table_name IN VARCHAR2) RETURN BOOLEAN IS
+        v_dummy NUMBER;
+    BEGIN
+        SELECT 1
+          INTO v_dummy
+          FROM user_tables
+         WHERE table_name = UPPER(p_table_name);
+
+        RETURN TRUE;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RETURN FALSE;
+    END table_exists;
+
+    ------------------------------------------------------------------
+    -- Report overall schema space
+    ------------------------------------------------------------------
+    PROCEDURE report_schema_space IS
+        v_schema_name VARCHAR2(128) := USER;
+    BEGIN
+        put_rule(60);
+        put_line('Space Usage Report for Schema: ' || v_schema_name);
+        put_rule(60);
+        put_line;
+
+        FOR rec IN (
+            SELECT ROUND(SUM(bytes) / 1024 / 1024, 2) AS used_mb,
+                   ROUND(SUM(bytes) / 1024 / 1024 / 1024, 2) AS used_gb,
+                   ROUND(SUM(bytes) / 1024 / 1024 / 1024 / 1024, 4) AS used_tb
+              FROM user_segments
+        ) LOOP
+            put_line('TOTAL USAGE');
+            put_line('  SCHEMA : ' || v_schema_name);
+            put_line('  USED_MB: ' || fmt_num(rec.used_mb, '999,999,999.00'));
+            put_line('  USED_GB: ' || fmt_num(rec.used_gb, '999,999,999.00'));
+            put_line('  USED_TB: ' || fmt_num(rec.used_tb, '999,999,999.0000'));
+            put_line;
+        END LOOP;
+
+        put_line('DETAILED PARTITION USAGE');
+        put_line(
+            RPAD('OBJECT_NAME', 32) ||
+            RPAD('PARTITION_NAME', 32) ||
+            RPAD('TABLESPACE_NAME', 22) ||
             LPAD('USED_MB', 14) ||
+            LPAD('USED_GB', 14) ||
             LPAD('ROW_COUNT', 14)
         );
-        DBMS_OUTPUT.PUT_LINE(RPAD('-', 80, '-'));
+        put_rule(128);
 
-        BEGIN
-            SELECT column_name
-              INTO v_colname
-              FROM user_tab_columns
-             WHERE table_name = 'USER_JSON_COLLECTIONS'
-               AND data_type IN ('NUMBER','FLOAT')
-               AND column_name NOT IN ('ROW_COUNT')
-               AND ROWNUM = 1;
+        FOR rec IN (
+            SELECT s.segment_name AS object_name,
+                   s.partition_name,
+                   s.tablespace_name,
+                   ROUND(SUM(s.bytes) / 1024 / 1024, 2) AS used_mb,
+                   ROUND(SUM(s.bytes) / 1024 / 1024 / 1024, 2) AS used_gb,
+                   NVL(tp.num_rows, 0) AS row_count
+              FROM user_segments s
+              LEFT JOIN user_tab_partitions tp
+                ON tp.table_name = s.segment_name
+               AND tp.partition_name = s.partition_name
+             WHERE s.partition_name IS NOT NULL
+             GROUP BY s.segment_name,
+                      s.partition_name,
+                      s.tablespace_name,
+                      tp.num_rows
+             ORDER BY SUM(s.bytes) DESC
+        ) LOOP
+            put_line(
+                RPAD(NVL(rec.object_name, ' '), 32) ||
+                RPAD(NVL(rec.partition_name, ' '), 32) ||
+                RPAD(NVL(rec.tablespace_name, ' '), 22) ||
+                LPAD(fmt_num(rec.used_mb, '999,999,990.00'), 14) ||
+                LPAD(fmt_num(rec.used_gb, '999,999,990.00'), 14) ||
+                LPAD(fmt_num(rec.row_count, '999,999,999'), 14)
+            );
+        END LOOP;
 
-            v_sql :=
-                'SELECT collection_name, storage_model, ' ||
-                'ROUND(' || v_colname || ' / 1024 / 1024, 2), row_count ' ||
-                'FROM user_json_collections ORDER BY ' || v_colname || ' DESC';
+        put_line;
+        put_line('NON-PARTITIONED OBJECT USAGE');
+        put_line(
+            RPAD('OBJECT_NAME', 32) ||
+            RPAD('SEGMENT_TYPE', 28) ||
+            RPAD('TABLESPACE_NAME', 22) ||
+            LPAD('USED_MB', 14) ||
+            LPAD('USED_GB', 14) ||
+            LPAD('ROW_COUNT', 14)
+        );
+        put_rule(128);
 
-            OPEN c FOR v_sql;
+        FOR rec IN (
+            SELECT s.segment_name AS object_name,
+                   s.segment_type,
+                   s.tablespace_name,
+                   ROUND(SUM(s.bytes) / 1024 / 1024, 2) AS used_mb,
+                   ROUND(SUM(s.bytes) / 1024 / 1024 / 1024, 2) AS used_gb,
+                   NVL(t.num_rows, 0) AS row_count
+              FROM user_segments s
+              LEFT JOIN user_tables t
+                ON t.table_name = s.segment_name
+             WHERE s.partition_name IS NULL
+             GROUP BY s.segment_name,
+                      s.segment_type,
+                      s.tablespace_name,
+                      t.num_rows
+             ORDER BY SUM(s.bytes) DESC
+        ) LOOP
+            put_line(
+                RPAD(NVL(rec.object_name, ' '), 32) ||
+                RPAD(NVL(rec.segment_type, ' '), 28) ||
+                RPAD(NVL(rec.tablespace_name, ' '), 22) ||
+                LPAD(fmt_num(rec.used_mb, '999,999,990.00'), 14) ||
+                LPAD(fmt_num(rec.used_gb, '999,999,990.00'), 14) ||
+                LPAD(fmt_num(rec.row_count, '999,999,999'), 14)
+            );
+        END LOOP;
+    END report_schema_space;
 
-            LOOP
-                FETCH c INTO r_collection_name, r_storage_model, r_used_mb, r_row_count;
-                EXIT WHEN c%NOTFOUND;
+    ------------------------------------------------------------------
+    -- Report a single table size
+    ------------------------------------------------------------------
+    PROCEDURE report_table_size (
+        p_table_name IN VARCHAR2,
+        p_live_count IN BOOLEAN DEFAULT FALSE
+    ) IS
+        v_table_name VARCHAR2(128) := UPPER(p_table_name);
+        v_row_count  NUMBER := 0;
+        v_count_sql  VARCHAR2(1000);
+        v_found      BOOLEAN := FALSE;
+    BEGIN
+        IF NOT table_exists(v_table_name) THEN
+            put_line('No table found for ' || USER || '.' || v_table_name);
+            RETURN;
+        END IF;
 
-                DBMS_OUTPUT.PUT_LINE(
-                    RPAD(r_collection_name, 32) ||
-                    RPAD(r_storage_model, 16) ||
-                    LPAD(TO_CHAR(r_used_mb, '999,999,990.00'), 14) ||
-                    LPAD(TO_CHAR(r_row_count, '999,999,999'), 14)
-                );
-            END LOOP;
-            CLOSE c;
+        put_rule(60);
+        put_line('Table Size Report');
+        put_line('Schema : ' || USER);
+        put_line('Table  : ' || v_table_name);
+        put_rule(60);
 
-        EXCEPTION
-            WHEN NO_DATA_FOUND THEN
-                DBMS_OUTPUT.PUT_LINE('USER_JSON_COLLECTIONS found but I am working on this....');
-            WHEN OTHERS THEN
-                DBMS_OUTPUT.PUT_LINE('USER_JSON_COLLECTIONS view not accessible or unsupported in this release.');
-        END;
+        IF p_live_count THEN
+            v_count_sql := 'SELECT COUNT(*) FROM "' || REPLACE(v_table_name, '"', '""') || '"';
+            EXECUTE IMMEDIATE v_count_sql INTO v_row_count;
+        ELSE
+            SELECT NVL(num_rows, 0)
+              INTO v_row_count
+              FROM user_tables
+             WHERE table_name = v_table_name;
+        END IF;
+
+        FOR rec IN (
+            SELECT segment_name AS table_name,
+                   ROUND(SUM(bytes) / 1024 / 1024, 2) AS size_mb,
+                   ROUND(SUM(bytes) / 1024 / 1024 / 1024, 2) AS size_gb,
+                   ROUND(SUM(bytes) / 1024 / 1024 / 1024 / 1024, 4) AS size_tb
+              FROM user_segments
+             WHERE segment_name = v_table_name
+               AND segment_type IN ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')
+             GROUP BY segment_name
+        ) LOOP
+            v_found := TRUE;
+            put_line('Row count      : ' || fmt_num(v_row_count, '999,999,999,999'));
+            put_line('Table size (MB): ' || fmt_num(rec.size_mb, '999,999,999.00'));
+            put_line('Table size (GB): ' || fmt_num(rec.size_gb, '999,999,999.00'));
+            put_line('Table size (TB): ' || fmt_num(rec.size_tb, '999,999,999.0000'));
+        END LOOP;
+
+        IF NOT v_found THEN
+            put_line('No allocated segments found for ' || USER || '.' || v_table_name);
+        END IF;
+
+        put_line;
+        put_line('Partition Breakdown (if any)');
+        put_line(
+            RPAD('PARTITION_NAME', 30) ||
+            LPAD('SIZE_MB', 15) ||
+            LPAD('SIZE_GB', 15) ||
+            LPAD('SIZE_TB', 15) ||
+            LPAD('ROWS', 15)
+        );
+        put_rule(90);
+
+        FOR part_rec IN (
+            SELECT s.partition_name,
+                   ROUND(SUM(s.bytes) / 1024 / 1024, 2) AS size_mb,
+                   ROUND(SUM(s.bytes) / 1024 / 1024 / 1024, 2) AS size_gb,
+                   ROUND(SUM(s.bytes) / 1024 / 1024 / 1024 / 1024, 4) AS size_tb,
+                   NVL(p.num_rows, 0) AS num_rows
+              FROM user_segments s
+              LEFT JOIN user_tab_partitions p
+                ON p.table_name = s.segment_name
+               AND p.partition_name = s.partition_name
+             WHERE s.segment_name = v_table_name
+               AND s.partition_name IS NOT NULL
+             GROUP BY s.partition_name, p.num_rows
+             ORDER BY size_mb DESC
+        ) LOOP
+            put_line(
+                RPAD(NVL(part_rec.partition_name, '-'), 30) ||
+                LPAD(fmt_num(part_rec.size_mb, '999,999,999.00'), 15) ||
+                LPAD(fmt_num(part_rec.size_gb, '999,999,999.00'), 15) ||
+                LPAD(fmt_num(part_rec.size_tb, '999,999,999.0000'), 15) ||
+                LPAD(fmt_num(part_rec.num_rows, '999,999,999,999'), 15)
+            );
+        END LOOP;
+
+        put_rule(60);
     EXCEPTION
         WHEN OTHERS THEN
-            DBMS_OUTPUT.PUT_LINE('JSON collection information not available.');
-    END;
+            put_line('Error in report_table_size: ' || SQLERRM);
+    END report_table_size;
 
-END;
+    ------------------------------------------------------------------
+    -- Report table storage map
+    ------------------------------------------------------------------
+    PROCEDURE report_table_storage_map (
+        p_table_name IN VARCHAR2
+    ) IS
+        v_table_name    VARCHAR2(128) := UPPER(p_table_name);
+        v_found         BOOLEAN := FALSE;
+        v_use_datafiles BOOLEAN := TRUE;
+    BEGIN
+        IF NOT table_exists(v_table_name) THEN
+            put_line('No table found for ' || USER || '.' || v_table_name);
+            RETURN;
+        END IF;
+
+        BEGIN
+            FOR r IN (
+                WITH ts_total AS (
+                    SELECT
+                        s.tablespace_name,
+                        SUM(s.bytes) AS total_bytes
+                    FROM user_segments s
+                    GROUP BY s.tablespace_name
+                ),
+                ts_files AS (
+                    SELECT
+                        df.tablespace_name,
+                        df.file_name,
+                        df.bytes AS file_bytes
+                    FROM sys.dba_data_files df
+                )
+                SELECT
+                    USER AS owner,
+                    x.table_name,
+                    x.storage_level,
+                    x.partition_name,
+                    x.subpartition_name,
+                    x.tablespace_name,
+                    tf.file_name,
+                    ROUND(x.bytes / 1024 / 1024, 2) AS size_mb,
+                    ROUND(x.bytes / 1024 / 1024 / 1024, 2) AS size_gb,
+                    ROUND(x.bytes / 1024 / 1024 / 1024 / 1024, 4) AS size_tb,
+                    ROUND(NVL(tf.file_bytes, 0) / 1024 / 1024, 2) AS datafile_mb,
+                    ROUND(NVL(tf.file_bytes, 0) / 1024 / 1024 / 1024, 2) AS datafile_gb,
+                    ROUND(NVL(tf.file_bytes, 0) / 1024 / 1024 / 1024 / 1024, 4) AS datafile_tb,
+                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024, 2) AS tablespace_total_mb,
+                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024 / 1024, 2) AS tablespace_total_gb,
+                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024 / 1024 / 1024, 4) AS tablespace_total_tb
+                FROM (
+                    SELECT
+                        s.segment_name AS table_name,
+                        'TABLE' AS storage_level,
+                        CAST(NULL AS VARCHAR2(128)) AS partition_name,
+                        CAST(NULL AS VARCHAR2(128)) AS subpartition_name,
+                        s.tablespace_name,
+                        s.bytes
+                    FROM user_segments s
+                    WHERE s.segment_type = 'TABLE'
+
+                    UNION ALL
+
+                    SELECT
+                        s.segment_name AS table_name,
+                        'PARTITION' AS storage_level,
+                        s.partition_name,
+                        CAST(NULL AS VARCHAR2(128)) AS subpartition_name,
+                        s.tablespace_name,
+                        s.bytes
+                    FROM user_segments s
+                    WHERE s.segment_type = 'TABLE PARTITION'
+
+                    UNION ALL
+
+                    SELECT
+                        s.segment_name AS table_name,
+                        'SUBPARTITION' AS storage_level,
+                        CAST(NULL AS VARCHAR2(128)) AS partition_name,
+                        s.partition_name AS subpartition_name,
+                        s.tablespace_name,
+                        s.bytes
+                    FROM user_segments s
+                    WHERE s.segment_type = 'TABLE SUBPARTITION'
+                ) x
+                LEFT JOIN ts_total ts
+                    ON x.tablespace_name = ts.tablespace_name
+                LEFT JOIN ts_files tf
+                    ON x.tablespace_name = tf.tablespace_name
+                WHERE x.table_name = v_table_name
+                ORDER BY
+                    CASE x.storage_level
+                        WHEN 'TABLE' THEN 1
+                        WHEN 'PARTITION' THEN 2
+                        WHEN 'SUBPARTITION' THEN 3
+                        ELSE 4
+                    END,
+                    x.partition_name,
+                    x.subpartition_name,
+                    tf.file_name
+            ) LOOP
+                IF NOT v_found THEN
+                    put_line(
+                        RPAD('OWNER',20) ||
+                        RPAD('TABLE_NAME',30) ||
+                        RPAD('LEVEL',15) ||
+                        RPAD('PARTITION_NAME',30) ||
+                        RPAD('SUBPARTITION_NAME',30) ||
+                        RPAD('TABLESPACE_NAME',24) ||
+                        RPAD('FILE_NAME',60) ||
+                        LPAD('SIZE_MB',12) ||
+                        LPAD('SIZE_GB',12) ||
+                        LPAD('SIZE_TB',12) ||
+                        LPAD('DF_MB',12) ||
+                        LPAD('DF_GB',12) ||
+                        LPAD('DF_TB',12) ||
+                        LPAD('TS_MB',12) ||
+                        LPAD('TS_GB',12) ||
+                        LPAD('TS_TB',12)
+                    );
+                    put_rule(365);
+                END IF;
+
+                v_found := TRUE;
+
+                put_line(
+                    RPAD(r.owner,20) ||
+                    RPAD(r.table_name,30) ||
+                    RPAD(r.storage_level,15) ||
+                    RPAD(NVL(r.partition_name,'-'),30) ||
+                    RPAD(NVL(r.subpartition_name,'-'),30) ||
+                    RPAD(NVL(r.tablespace_name,'-'),24) ||
+                    RPAD(SUBSTR(NVL(r.file_name,'-'),1,60),60) ||
+                    LPAD(fmt_num(r.size_mb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.size_gb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.size_tb, '999999990.0000'),12) ||
+                    LPAD(fmt_num(r.datafile_mb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.datafile_gb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.datafile_tb, '999999990.0000'),12) ||
+                    LPAD(fmt_num(r.tablespace_total_mb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.tablespace_total_gb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.tablespace_total_tb, '999999990.0000'),12)
+                );
+            END LOOP;
+
+        EXCEPTION
+            WHEN OTHERS THEN
+                v_use_datafiles := FALSE;
+        END;
+
+        IF NOT v_use_datafiles THEN
+            v_found := FALSE;
+
+            put_line('Note: SYS.DBA_DATA_FILES is not accessible; reporting without datafile detail.');
+            put_line(
+                RPAD('OWNER',20) ||
+                RPAD('TABLE_NAME',30) ||
+                RPAD('LEVEL',15) ||
+                RPAD('PARTITION_NAME',30) ||
+                RPAD('SUBPARTITION_NAME',30) ||
+                RPAD('TABLESPACE_NAME',24) ||
+                LPAD('SIZE_MB',12) ||
+                LPAD('SIZE_GB',12) ||
+                LPAD('SIZE_TB',12) ||
+                LPAD('TS_MB',12) ||
+                LPAD('TS_GB',12) ||
+                LPAD('TS_TB',12)
+            );
+            put_rule(243);
+
+            FOR r IN (
+                WITH ts_total AS (
+                    SELECT
+                        s.tablespace_name,
+                        SUM(s.bytes) AS total_bytes
+                    FROM user_segments s
+                    GROUP BY s.tablespace_name
+                )
+                SELECT
+                    USER AS owner,
+                    x.table_name,
+                    x.storage_level,
+                    x.partition_name,
+                    x.subpartition_name,
+                    x.tablespace_name,
+                    ROUND(x.bytes / 1024 / 1024, 2) AS size_mb,
+                    ROUND(x.bytes / 1024 / 1024 / 1024, 2) AS size_gb,
+                    ROUND(x.bytes / 1024 / 1024 / 1024 / 1024, 4) AS size_tb,
+                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024, 2) AS tablespace_total_mb,
+                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024 / 1024, 2) AS tablespace_total_gb,
+                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024 / 1024 / 1024, 4) AS tablespace_total_tb
+                FROM (
+                    SELECT
+                        s.segment_name AS table_name,
+                        'TABLE' AS storage_level,
+                        CAST(NULL AS VARCHAR2(128)) AS partition_name,
+                        CAST(NULL AS VARCHAR2(128)) AS subpartition_name,
+                        s.tablespace_name,
+                        s.bytes
+                    FROM user_segments s
+                    WHERE s.segment_type = 'TABLE'
+
+                    UNION ALL
+
+                    SELECT
+                        s.segment_name AS table_name,
+                        'PARTITION' AS storage_level,
+                        s.partition_name,
+                        CAST(NULL AS VARCHAR2(128)) AS subpartition_name,
+                        s.tablespace_name,
+                        s.bytes
+                    FROM user_segments s
+                    WHERE s.segment_type = 'TABLE PARTITION'
+
+                    UNION ALL
+
+                    SELECT
+                        s.segment_name AS table_name,
+                        'SUBPARTITION' AS storage_level,
+                        CAST(NULL AS VARCHAR2(128)) AS partition_name,
+                        s.partition_name AS subpartition_name,
+                        s.tablespace_name,
+                        s.bytes
+                    FROM user_segments s
+                    WHERE s.segment_type = 'TABLE SUBPARTITION'
+                ) x
+                LEFT JOIN ts_total ts
+                    ON x.tablespace_name = ts.tablespace_name
+                WHERE x.table_name = v_table_name
+                ORDER BY
+                    CASE x.storage_level
+                        WHEN 'TABLE' THEN 1
+                        WHEN 'PARTITION' THEN 2
+                        WHEN 'SUBPARTITION' THEN 3
+                        ELSE 4
+                    END,
+                    x.partition_name,
+                    x.subpartition_name
+            ) LOOP
+                v_found := TRUE;
+
+                put_line(
+                    RPAD(r.owner,20) ||
+                    RPAD(r.table_name,30) ||
+                    RPAD(r.storage_level,15) ||
+                    RPAD(NVL(r.partition_name,'-'),30) ||
+                    RPAD(NVL(r.subpartition_name,'-'),30) ||
+                    RPAD(NVL(r.tablespace_name,'-'),24) ||
+                    LPAD(fmt_num(r.size_mb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.size_gb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.size_tb, '999999990.0000'),12) ||
+                    LPAD(fmt_num(r.tablespace_total_mb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.tablespace_total_gb, '999999990.00'),12) ||
+                    LPAD(fmt_num(r.tablespace_total_tb, '999999990.0000'),12)
+                );
+            END LOOP;
+        END IF;
+
+        IF NOT v_found THEN
+            put_line('No storage rows found for ' || USER || '.' || v_table_name);
+        END IF;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            put_line('Error in report_table_storage_map: ' || SQLERRM);
+    END report_table_storage_map;
+
+    ------------------------------------------------------------------
+    -- Report JSON collections
+    ------------------------------------------------------------------
+    PROCEDURE report_json_collections (
+        p_collection_name IN VARCHAR2 DEFAULT NULL,
+        p_live_count      IN BOOLEAN  DEFAULT FALSE
+    ) IS
+        v_collection_name   VARCHAR2(128) := UPPER(TRIM(p_collection_name));
+        v_found             BOOLEAN := FALSE;
+        v_row_count         NUMBER;
+        v_count_sql         VARCHAR2(1000);
+    BEGIN
+        put_line;
+        put_line('JSON COLLECTION TABLES');
+        IF v_collection_name IS NOT NULL THEN
+            put_line('Filter          : ' || v_collection_name);
+        ELSE
+            put_line('Filter          : ALL');
+        END IF;
+        put_line('Row count mode  : ' ||
+                 CASE WHEN p_live_count THEN 'LIVE COUNT(*)'
+                      ELSE 'USER_TABLES.NUM_ROWS'
+                 END);
+
+        put_line(
+            RPAD('COLLECTION_NAME', 32) ||
+            RPAD('WITH_ETAG', 12) ||
+            RPAD('TABLESPACE_NAME', 24) ||
+            LPAD('USED_MB', 14) ||
+            LPAD('USED_GB', 14) ||
+            LPAD('USED_TB', 14) ||
+            LPAD('ROW_COUNT', 14)
+        );
+        put_rule(124);
+
+        FOR r IN (
+            SELECT
+                j.collection_name,
+                NVL(j.with_etag, 'NO') AS with_etag,
+                s.tablespace_name,
+                ROUND(NVL(SUM(s.bytes), 0) / 1024 / 1024, 2) AS used_mb,
+                ROUND(NVL(SUM(s.bytes), 0) / 1024 / 1024 / 1024, 2) AS used_gb,
+                ROUND(NVL(SUM(s.bytes), 0) / 1024 / 1024 / 1024 / 1024, 4) AS used_tb,
+                NVL(t.num_rows, 0) AS stats_row_count
+            FROM user_json_collection_tables j
+            LEFT JOIN user_segments s
+                ON s.segment_name = j.collection_name
+               AND s.segment_type IN ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')
+            LEFT JOIN user_tables t
+                ON t.table_name = j.collection_name
+            WHERE v_collection_name IS NULL
+               OR j.collection_name = v_collection_name
+            GROUP BY
+                j.collection_name,
+                j.with_etag,
+                s.tablespace_name,
+                t.num_rows
+            ORDER BY
+                used_mb DESC,
+                j.collection_name,
+                s.tablespace_name
+        ) LOOP
+            v_found := TRUE;
+
+            IF p_live_count THEN
+                BEGIN
+                    v_count_sql :=
+                        'SELECT COUNT(*) FROM "' ||
+                        REPLACE(r.collection_name, '"', '""') || '"';
+
+                    EXECUTE IMMEDIATE v_count_sql INTO v_row_count;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        v_row_count := NULL;
+                END;
+            ELSE
+                v_row_count := r.stats_row_count;
+            END IF;
+
+            put_line(
+                RPAD(r.collection_name, 32) ||
+                RPAD(r.with_etag, 12) ||
+                RPAD(NVL(r.tablespace_name, '-'), 24) ||
+                LPAD(fmt_num(r.used_mb, '999,999,990.00'), 14) ||
+                LPAD(fmt_num(r.used_gb, '999,999,990.00'), 14) ||
+                LPAD(fmt_num(r.used_tb, '999,999,990.0000'), 14) ||
+                LPAD(
+                    CASE
+                        WHEN v_row_count IS NULL THEN 'ERROR'
+                        ELSE fmt_num(v_row_count, '999,999,999,999')
+                    END,
+                    14
+                )
+            );
+        END LOOP;
+
+        IF NOT v_found THEN
+            IF v_collection_name IS NULL THEN
+                put_line('No JSON collection tables found in schema ' || USER);
+            ELSE
+                put_line('No JSON collection table found for ' || USER || '.' || v_collection_name);
+            END IF;
+        END IF;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            put_line('Error in report_json_collections: ' || SQLERRM);
+    END report_json_collections;
+
+        ------------------------------------------------------------------
+    -- Report distinct tablespaces and datafiles for a table
+    ------------------------------------------------------------------
+    PROCEDURE report_table_datafiles (
+        p_table_name IN VARCHAR2
+    ) IS
+        v_table_name VARCHAR2(128) := UPPER(p_table_name);
+        v_found      BOOLEAN := FALSE;
+    BEGIN
+        IF NOT table_exists(v_table_name) THEN
+            put_line('No table found for ' || USER || '.' || v_table_name);
+            RETURN;
+        END IF;
+
+        BEGIN
+            put_line;
+            put_line('TABLE DATAFILES');
+            put_line('Schema : ' || USER);
+            put_line('Table  : ' || v_table_name);
+
+            put_line(
+                RPAD('TABLE_NAME',30) ||
+                RPAD('TABLESPACE_NAME',24) ||
+                RPAD('FILE_NAME',80) ||
+                LPAD('FILE_MB',14) ||
+                LPAD('FILE_GB',14) ||
+                LPAD('FILE_TB',14)
+            );
+
+            put_rule(162);
+
+            FOR r IN (
+                WITH table_tablespaces AS (
+                    SELECT DISTINCT
+                        s.segment_name AS table_name,
+                        s.tablespace_name
+                    FROM user_segments s
+                    WHERE s.segment_name = v_table_name
+                      AND s.segment_type IN ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')
+                      AND s.tablespace_name IS NOT NULL
+                )
+                SELECT
+                    tt.table_name,
+                    tt.tablespace_name,
+                    df.file_name,
+                    ROUND(df.bytes / 1024 / 1024, 2) AS file_mb,
+                    ROUND(df.bytes / 1024 / 1024 / 1024, 2) AS file_gb,
+                    ROUND(df.bytes / 1024 / 1024 / 1024 / 1024, 4) AS file_tb
+                FROM table_tablespaces tt
+                JOIN sys.dba_data_files df
+                  ON df.tablespace_name = tt.tablespace_name
+                ORDER BY
+                    tt.tablespace_name,
+                    df.file_name
+            ) LOOP
+                v_found := TRUE;
+
+                put_line(
+                    RPAD(r.table_name,30) ||
+                    RPAD(r.tablespace_name,24) ||
+                    RPAD(SUBSTR(r.file_name,1,80),80) ||
+                    LPAD(fmt_num(r.file_mb, '999,999,990.00'),14) ||
+                    LPAD(fmt_num(r.file_gb, '999,999,990.00'),14) ||
+                    LPAD(fmt_num(r.file_tb, '999,999,990.0000'),14)
+                );
+            END LOOP;
+
+            IF NOT v_found THEN
+                put_line('No datafiles found for table ' || USER || '.' || v_table_name);
+            END IF;
+
+        EXCEPTION
+            WHEN OTHERS THEN
+                put_line('Note: SYS.DBA_DATA_FILES is not accessible; cannot report datafile detail.');
+                put_line('Grant required: GRANT SELECT ON SYS.DBA_DATA_FILES TO ' || USER || ';');
+        END;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            put_line('Error in report_table_datafiles: ' || SQLERRM);
+    END report_table_datafiles;
+
+
+END space_report_pkg;
 /
+
+
+/* 
+
+Run examples
+
+*/
+set serveroutput on;
+exec space_report_pkg.report_schema_space;
+exec space_report_pkg.report_table_size('foobar');
+exec space_report_pkg.report_table_storage_map('foobar');
+exec space_report_pkg.report_json_collections;
+
+
 
