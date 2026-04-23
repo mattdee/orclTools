@@ -282,264 +282,84 @@ CREATE OR REPLACE PACKAGE BODY space_report_pkg AS
     PROCEDURE report_table_storage_map (
         p_table_name IN VARCHAR2
     ) IS
-        v_table_name    VARCHAR2(128) := UPPER(p_table_name);
-        v_found         BOOLEAN := FALSE;
-        v_use_datafiles BOOLEAN := TRUE;
+        v_table_name VARCHAR2(128) := UPPER(p_table_name);
+        v_found      BOOLEAN := FALSE;
+
+        FUNCTION short_file(p_file VARCHAR2) RETURN VARCHAR2 IS
+        BEGIN
+            RETURN CASE
+                WHEN LENGTH(p_file) > 60 THEN '...' || SUBSTR(p_file, -57)
+                ELSE p_file
+            END;
+        END;
     BEGIN
         IF NOT table_exists(v_table_name) THEN
             put_line('No table found for ' || USER || '.' || v_table_name);
             RETURN;
         END IF;
 
-        BEGIN
-            FOR r IN (
-                WITH ts_total AS (
-                    SELECT
-                        s.tablespace_name,
-                        SUM(s.bytes) AS total_bytes
-                    FROM user_segments s
-                    GROUP BY s.tablespace_name
-                ),
-                ts_files AS (
-                    SELECT
-                        df.tablespace_name,
-                        df.file_name,
-                        df.bytes AS file_bytes
-                    FROM sys.dba_data_files df
-                )
-                SELECT
-                    USER AS owner,
-                    x.table_name,
-                    x.storage_level,
-                    x.partition_name,
-                    x.subpartition_name,
-                    x.tablespace_name,
-                    tf.file_name,
-                    ROUND(x.bytes / 1024 / 1024, 2) AS size_mb,
-                    ROUND(x.bytes / 1024 / 1024 / 1024, 2) AS size_gb,
-                    ROUND(x.bytes / 1024 / 1024 / 1024 / 1024, 4) AS size_tb,
-                    ROUND(NVL(tf.file_bytes, 0) / 1024 / 1024, 2) AS datafile_mb,
-                    ROUND(NVL(tf.file_bytes, 0) / 1024 / 1024 / 1024, 2) AS datafile_gb,
-                    ROUND(NVL(tf.file_bytes, 0) / 1024 / 1024 / 1024 / 1024, 4) AS datafile_tb,
-                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024, 2) AS tablespace_total_mb,
-                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024 / 1024, 2) AS tablespace_total_gb,
-                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024 / 1024 / 1024, 4) AS tablespace_total_tb
-                FROM (
-                    SELECT
-                        s.segment_name AS table_name,
-                        'TABLE' AS storage_level,
-                        CAST(NULL AS VARCHAR2(128)) AS partition_name,
-                        CAST(NULL AS VARCHAR2(128)) AS subpartition_name,
-                        s.tablespace_name,
-                        s.bytes
-                    FROM user_segments s
-                    WHERE s.segment_type = 'TABLE'
+        put_rule(60);
+        put_line('TABLE STORAGE MAP');
+        put_line('Schema : ' || USER);
+        put_line('Table  : ' || v_table_name);
+        put_rule(60);
 
-                    UNION ALL
+        put_line(
+            RPAD('LEVEL',12) ||
+            RPAD('PARTITION',18) ||
+            RPAD('TABLESPACE',20) ||
+            RPAD('DATAFILE',60) ||
+            LPAD('SIZE_MB',12) ||
+            LPAD('TS_MB',12)
+        );
 
-                    SELECT
-                        s.segment_name AS table_name,
-                        'PARTITION' AS storage_level,
-                        s.partition_name,
-                        CAST(NULL AS VARCHAR2(128)) AS subpartition_name,
-                        s.tablespace_name,
-                        s.bytes
-                    FROM user_segments s
-                    WHERE s.segment_type = 'TABLE PARTITION'
+        put_rule(134);
 
-                    UNION ALL
+        FOR r IN (
+            WITH ts_total AS (
+                SELECT tablespace_name, SUM(bytes) total_bytes
+                FROM user_segments
+                GROUP BY tablespace_name
+            )
+            SELECT
+                x.storage_level,
+                x.partition_name,
+                x.tablespace_name,
+                df.file_name,
+                ROUND(x.bytes/1024/1024,2) size_mb,
+                ROUND(ts.total_bytes/1024/1024,2) ts_mb
+            FROM (
+                SELECT segment_name table_name,
+                       'PARTITION' storage_level,
+                       partition_name,
+                       tablespace_name,
+                       bytes
+                FROM user_segments
+                WHERE segment_type = 'TABLE PARTITION'
+            ) x
+            LEFT JOIN ts_total ts
+              ON ts.tablespace_name = x.tablespace_name
+            LEFT JOIN sys.dba_data_files df
+              ON df.tablespace_name = x.tablespace_name
+            WHERE x.table_name = v_table_name
+            ORDER BY partition_name
+        ) LOOP
+            v_found := TRUE;
 
-                    SELECT
-                        s.segment_name AS table_name,
-                        'SUBPARTITION' AS storage_level,
-                        CAST(NULL AS VARCHAR2(128)) AS partition_name,
-                        s.partition_name AS subpartition_name,
-                        s.tablespace_name,
-                        s.bytes
-                    FROM user_segments s
-                    WHERE s.segment_type = 'TABLE SUBPARTITION'
-                ) x
-                LEFT JOIN ts_total ts
-                    ON x.tablespace_name = ts.tablespace_name
-                LEFT JOIN ts_files tf
-                    ON x.tablespace_name = tf.tablespace_name
-                WHERE x.table_name = v_table_name
-                ORDER BY
-                    CASE x.storage_level
-                        WHEN 'TABLE' THEN 1
-                        WHEN 'PARTITION' THEN 2
-                        WHEN 'SUBPARTITION' THEN 3
-                        ELSE 4
-                    END,
-                    x.partition_name,
-                    x.subpartition_name,
-                    tf.file_name
-            ) LOOP
-                IF NOT v_found THEN
-                    put_line(
-                        RPAD('OWNER',20) ||
-                        RPAD('TABLE_NAME',30) ||
-                        RPAD('LEVEL',15) ||
-                        RPAD('PARTITION_NAME',30) ||
-                        RPAD('SUBPARTITION_NAME',30) ||
-                        RPAD('TABLESPACE_NAME',24) ||
-                        RPAD('FILE_NAME',60) ||
-                        LPAD('SIZE_MB',12) ||
-                        LPAD('SIZE_GB',12) ||
-                        LPAD('SIZE_TB',12) ||
-                        LPAD('DF_MB',12) ||
-                        LPAD('DF_GB',12) ||
-                        LPAD('DF_TB',12) ||
-                        LPAD('TS_MB',12) ||
-                        LPAD('TS_GB',12) ||
-                        LPAD('TS_TB',12)
-                    );
-                    put_rule(365);
-                END IF;
-
-                v_found := TRUE;
-
-                put_line(
-                    RPAD(r.owner,20) ||
-                    RPAD(r.table_name,30) ||
-                    RPAD(r.storage_level,15) ||
-                    RPAD(NVL(r.partition_name,'-'),30) ||
-                    RPAD(NVL(r.subpartition_name,'-'),30) ||
-                    RPAD(NVL(r.tablespace_name,'-'),24) ||
-                    RPAD(SUBSTR(NVL(r.file_name,'-'),1,60),60) ||
-                    LPAD(fmt_num(r.size_mb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.size_gb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.size_tb, '999999990.0000'),12) ||
-                    LPAD(fmt_num(r.datafile_mb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.datafile_gb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.datafile_tb, '999999990.0000'),12) ||
-                    LPAD(fmt_num(r.tablespace_total_mb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.tablespace_total_gb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.tablespace_total_tb, '999999990.0000'),12)
-                );
-            END LOOP;
-
-        EXCEPTION
-            WHEN OTHERS THEN
-                v_use_datafiles := FALSE;
-        END;
-
-        IF NOT v_use_datafiles THEN
-            v_found := FALSE;
-
-            put_line('Note: SYS.DBA_DATA_FILES is not accessible; reporting without datafile detail.');
             put_line(
-                RPAD('OWNER',20) ||
-                RPAD('TABLE_NAME',30) ||
-                RPAD('LEVEL',15) ||
-                RPAD('PARTITION_NAME',30) ||
-                RPAD('SUBPARTITION_NAME',30) ||
-                RPAD('TABLESPACE_NAME',24) ||
-                LPAD('SIZE_MB',12) ||
-                LPAD('SIZE_GB',12) ||
-                LPAD('SIZE_TB',12) ||
-                LPAD('TS_MB',12) ||
-                LPAD('TS_GB',12) ||
-                LPAD('TS_TB',12)
+                RPAD(r.storage_level,12) ||
+                RPAD(NVL(r.partition_name,'-'),18) ||
+                RPAD(r.tablespace_name,20) ||
+                RPAD(short_file(r.file_name),60) ||
+                LPAD(fmt_num(r.size_mb,'999,999,990.0'),12) ||
+                LPAD(fmt_num(r.ts_mb,'999,999,990.0'),12)
             );
-            put_rule(243);
-
-            FOR r IN (
-                WITH ts_total AS (
-                    SELECT
-                        s.tablespace_name,
-                        SUM(s.bytes) AS total_bytes
-                    FROM user_segments s
-                    GROUP BY s.tablespace_name
-                )
-                SELECT
-                    USER AS owner,
-                    x.table_name,
-                    x.storage_level,
-                    x.partition_name,
-                    x.subpartition_name,
-                    x.tablespace_name,
-                    ROUND(x.bytes / 1024 / 1024, 2) AS size_mb,
-                    ROUND(x.bytes / 1024 / 1024 / 1024, 2) AS size_gb,
-                    ROUND(x.bytes / 1024 / 1024 / 1024 / 1024, 4) AS size_tb,
-                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024, 2) AS tablespace_total_mb,
-                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024 / 1024, 2) AS tablespace_total_gb,
-                    ROUND(NVL(ts.total_bytes, 0) / 1024 / 1024 / 1024 / 1024, 4) AS tablespace_total_tb
-                FROM (
-                    SELECT
-                        s.segment_name AS table_name,
-                        'TABLE' AS storage_level,
-                        CAST(NULL AS VARCHAR2(128)) AS partition_name,
-                        CAST(NULL AS VARCHAR2(128)) AS subpartition_name,
-                        s.tablespace_name,
-                        s.bytes
-                    FROM user_segments s
-                    WHERE s.segment_type = 'TABLE'
-
-                    UNION ALL
-
-                    SELECT
-                        s.segment_name AS table_name,
-                        'PARTITION' AS storage_level,
-                        s.partition_name,
-                        CAST(NULL AS VARCHAR2(128)) AS subpartition_name,
-                        s.tablespace_name,
-                        s.bytes
-                    FROM user_segments s
-                    WHERE s.segment_type = 'TABLE PARTITION'
-
-                    UNION ALL
-
-                    SELECT
-                        s.segment_name AS table_name,
-                        'SUBPARTITION' AS storage_level,
-                        CAST(NULL AS VARCHAR2(128)) AS partition_name,
-                        s.partition_name AS subpartition_name,
-                        s.tablespace_name,
-                        s.bytes
-                    FROM user_segments s
-                    WHERE s.segment_type = 'TABLE SUBPARTITION'
-                ) x
-                LEFT JOIN ts_total ts
-                    ON x.tablespace_name = ts.tablespace_name
-                WHERE x.table_name = v_table_name
-                ORDER BY
-                    CASE x.storage_level
-                        WHEN 'TABLE' THEN 1
-                        WHEN 'PARTITION' THEN 2
-                        WHEN 'SUBPARTITION' THEN 3
-                        ELSE 4
-                    END,
-                    x.partition_name,
-                    x.subpartition_name
-            ) LOOP
-                v_found := TRUE;
-
-                put_line(
-                    RPAD(r.owner,20) ||
-                    RPAD(r.table_name,30) ||
-                    RPAD(r.storage_level,15) ||
-                    RPAD(NVL(r.partition_name,'-'),30) ||
-                    RPAD(NVL(r.subpartition_name,'-'),30) ||
-                    RPAD(NVL(r.tablespace_name,'-'),24) ||
-                    LPAD(fmt_num(r.size_mb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.size_gb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.size_tb, '999999990.0000'),12) ||
-                    LPAD(fmt_num(r.tablespace_total_mb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.tablespace_total_gb, '999999990.00'),12) ||
-                    LPAD(fmt_num(r.tablespace_total_tb, '999999990.0000'),12)
-                );
-            END LOOP;
-        END IF;
+        END LOOP;
 
         IF NOT v_found THEN
-            put_line('No storage rows found for ' || USER || '.' || v_table_name);
+            put_line('No storage rows found.');
         END IF;
-
-    EXCEPTION
-        WHEN OTHERS THEN
-            put_line('Error in report_table_storage_map: ' || SQLERRM);
-    END report_table_storage_map;
+    END;
 
     ------------------------------------------------------------------
     -- Report JSON collections
@@ -658,79 +478,73 @@ CREATE OR REPLACE PACKAGE BODY space_report_pkg AS
     ) IS
         v_table_name VARCHAR2(128) := UPPER(p_table_name);
         v_found      BOOLEAN := FALSE;
+
+        FUNCTION short_file(p_file VARCHAR2) RETURN VARCHAR2 IS
+        BEGIN
+            RETURN CASE
+                WHEN LENGTH(p_file) > 60 THEN '...' || SUBSTR(p_file, -57)
+                ELSE p_file
+            END;
+        END;
     BEGIN
         IF NOT table_exists(v_table_name) THEN
             put_line('No table found for ' || USER || '.' || v_table_name);
             RETURN;
         END IF;
 
-        BEGIN
-            put_line;
-            put_line('TABLE DATAFILES');
-            put_line('Schema : ' || USER);
-            put_line('Table  : ' || v_table_name);
+        put_rule(60);
+        put_line('TABLE DATAFILES');
+        put_line('Schema : ' || USER);
+        put_line('Table  : ' || v_table_name);
+        put_rule(60);
+
+        put_line(
+            RPAD('TABLESPACE_NAME',24) ||
+            RPAD('FILE_NAME',60) ||
+            LPAD('FILE_MB',12) ||
+            LPAD('FILE_GB',12) ||
+            LPAD('FILE_TB',12)
+        );
+
+        put_rule(120);
+
+        FOR r IN (
+            WITH ts AS (
+                SELECT DISTINCT tablespace_name
+                FROM user_segments
+                WHERE segment_name = v_table_name
+                  AND segment_type IN ('TABLE','TABLE PARTITION','TABLE SUBPARTITION')
+            )
+            SELECT
+                ts.tablespace_name,
+                df.file_name,
+                ROUND(df.bytes/1024/1024,2) AS file_mb,
+                ROUND(df.bytes/1024/1024/1024,2) AS file_gb,
+                ROUND(df.bytes/1024/1024/1024/1024,4) AS file_tb
+            FROM ts
+            JOIN sys.dba_data_files df
+              ON df.tablespace_name = ts.tablespace_name
+            ORDER BY ts.tablespace_name, df.file_name
+        ) LOOP
+            v_found := TRUE;
 
             put_line(
-                RPAD('TABLE_NAME',30) ||
-                RPAD('TABLESPACE_NAME',24) ||
-                RPAD('FILE_NAME',80) ||
-                LPAD('FILE_MB',14) ||
-                LPAD('FILE_GB',14) ||
-                LPAD('FILE_TB',14)
+                RPAD(r.tablespace_name,24) ||
+                RPAD(short_file(r.file_name),60) ||
+                LPAD(fmt_num(r.file_mb,'999,999,990.0'),12) ||
+                LPAD(fmt_num(r.file_gb,'999,999,990.0'),12) ||
+                LPAD(fmt_num(r.file_tb,'999,999,990.0'),12)
             );
+        END LOOP;
 
-            put_rule(162);
-
-            FOR r IN (
-                WITH table_tablespaces AS (
-                    SELECT DISTINCT
-                        s.segment_name AS table_name,
-                        s.tablespace_name
-                    FROM user_segments s
-                    WHERE s.segment_name = v_table_name
-                      AND s.segment_type IN ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')
-                      AND s.tablespace_name IS NOT NULL
-                )
-                SELECT
-                    tt.table_name,
-                    tt.tablespace_name,
-                    df.file_name,
-                    ROUND(df.bytes / 1024 / 1024, 2) AS file_mb,
-                    ROUND(df.bytes / 1024 / 1024 / 1024, 2) AS file_gb,
-                    ROUND(df.bytes / 1024 / 1024 / 1024 / 1024, 4) AS file_tb
-                FROM table_tablespaces tt
-                JOIN sys.dba_data_files df
-                  ON df.tablespace_name = tt.tablespace_name
-                ORDER BY
-                    tt.tablespace_name,
-                    df.file_name
-            ) LOOP
-                v_found := TRUE;
-
-                put_line(
-                    RPAD(r.table_name,30) ||
-                    RPAD(r.tablespace_name,24) ||
-                    RPAD(SUBSTR(r.file_name,1,80),80) ||
-                    LPAD(fmt_num(r.file_mb, '999,999,990.00'),14) ||
-                    LPAD(fmt_num(r.file_gb, '999,999,990.00'),14) ||
-                    LPAD(fmt_num(r.file_tb, '999,999,990.0000'),14)
-                );
-            END LOOP;
-
-            IF NOT v_found THEN
-                put_line('No datafiles found for table ' || USER || '.' || v_table_name);
-            END IF;
-
-        EXCEPTION
-            WHEN OTHERS THEN
-                put_line('Note: SYS.DBA_DATA_FILES is not accessible; cannot report datafile detail.');
-                put_line('Grant required: GRANT SELECT ON SYS.DBA_DATA_FILES TO ' || USER || ';');
-        END;
+        IF NOT v_found THEN
+            put_line('No datafiles found.');
+        END IF;
 
     EXCEPTION
         WHEN OTHERS THEN
-            put_line('Error in report_table_datafiles: ' || SQLERRM);
-    END report_table_datafiles;
+            put_line('DBA_DATA_FILES not accessible.');
+    END;
 
 
 END space_report_pkg;
@@ -747,6 +561,4 @@ exec space_report_pkg.report_schema_space;
 exec space_report_pkg.report_table_size('foobar');
 exec space_report_pkg.report_table_storage_map('foobar');
 exec space_report_pkg.report_json_collections;
-
-
 
